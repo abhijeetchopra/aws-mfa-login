@@ -1,0 +1,219 @@
+#!/bin/sh -e
+
+# aws-assume-role: Assumes an AWS role from a named profile and creates
+# a new profile with static credentials for tools that don't support
+# automatic role assumption (e.g., IntelliJ without STS module)
+#
+# Usage: aws-assume-role <profile-name> [duration-hours]
+#        FORCE=1 aws-assume-role <profile-name>  # Force new credentials
+# Example: aws-assume-role rdc-com-ng-dev
+#          Creates: rdc-com-ng-dev-assumed profile
+
+# Check if AWS CLI is installed and callable
+if ! command -v aws >/dev/null 2>&1; then
+    echo "Missing module: AWS CLI"
+    exit 1
+fi
+
+# Check if JQ is installed and callable
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Missing module: jq json library"
+    exit 1
+fi
+
+# Check for required profile argument
+if [ -z "$1" ]; then
+    echo "Usage: aws-assume-role <profile-name> [duration-hours]"
+    echo "       FORCE=1 aws-assume-role <profile-name>  # Force new credentials"
+    echo ""
+    echo "Example: aws-assume-role rdc-com-ng-dev"
+    echo ""
+    echo "This script assumes the role defined in the given profile and creates"
+    echo "a new profile named '<profile-name>-assumed' with static credentials."
+    echo ""
+    echo "If valid credentials already exist, the script will display time remaining"
+    echo "and exit. Use FORCE=1 to get new credentials regardless."
+    exit 1
+fi
+
+PROFILE_NAME="$1"
+DURATION_HOURS="${2:-1}"
+DURATION_SECS=$((DURATION_HOURS * 3600))
+ASSUMED_PROFILE_NAME="${PROFILE_NAME}-assumed"
+
+# Read profile configuration from ~/.aws/config
+CONFIG_FILE="$HOME/.aws/config"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: AWS config file not found at $CONFIG_FILE"
+    exit 1
+fi
+
+# Extract role_arn from the profile
+ROLE_ARN=$(aws configure get role_arn --profile "$PROFILE_NAME" 2>/dev/null || true)
+if [ -z "$ROLE_ARN" ]; then
+    echo "ERROR: No role_arn found for profile '$PROFILE_NAME'"
+    echo "Make sure the profile exists in $CONFIG_FILE and has a role_arn defined."
+    exit 1
+fi
+
+# Extract source_profile from the profile
+SOURCE_PROFILE=$(aws configure get source_profile --profile "$PROFILE_NAME" 2>/dev/null || true)
+if [ -z "$SOURCE_PROFILE" ]; then
+    echo "ERROR: No source_profile found for profile '$PROFILE_NAME'"
+    echo "This script is designed for profiles that use source_profile for role assumption."
+    exit 1
+fi
+
+# Extract region from the profile (optional, will use default if not set)
+REGION=$(aws configure get region --profile "$PROFILE_NAME" 2>/dev/null || true)
+REGION_ARG=""
+if [ -n "$REGION" ]; then
+    REGION_ARG="--region $REGION"
+fi
+
+# Extract role_session_name from the profile (optional)
+ROLE_SESSION_NAME=$(aws configure get role_session_name --profile "$PROFILE_NAME" 2>/dev/null || true)
+if [ -z "$ROLE_SESSION_NAME" ]; then
+    ROLE_SESSION_NAME="assumed-role-session-$(whoami)"
+fi
+
+# Define markers for this profile's credentials block
+BEGIN_MARKER="# BEGIN ASSUMED CREDENTIALS FOR $PROFILE_NAME"
+END_MARKER="# END ASSUMED CREDENTIALS FOR $PROFILE_NAME"
+
+# Check if valid credentials already exist (unless FORCE=1 is set)
+if [ "$FORCE" != "1" ]; then
+    # Look for existing expiration in credentials file
+    EXISTING_EXPIRATION=$(grep -A5 "$BEGIN_MARKER" "$HOME/.aws/credentials" 2>/dev/null | grep "# Expires:" | sed 's/# Expires: //' || true)
+
+    if [ -n "$EXISTING_EXPIRATION" ]; then
+        # Try to validate credentials by calling get-caller-identity
+        set +e
+        aws --profile "$ASSUMED_PROFILE_NAME" sts get-caller-identity >/dev/null 2>&1
+        VALID=$?
+        set -e
+
+        if [ $VALID -eq 0 ]; then
+            # Credentials are valid - calculate time remaining
+            # Parse expiration time (ISO 8601 format: 2025-12-02T18:08:07+00:00)
+            # Remove timezone suffix and convert to epoch
+            EXPIRY_CLEAN=$(echo "$EXISTING_EXPIRATION" | sed 's/+00:00$//' | sed 's/Z$//')
+
+            # Try GNU date first, then BSD date (macOS)
+            if date --version >/dev/null 2>&1; then
+                # GNU date
+                EXPIRY_EPOCH=$(date -d "$EXPIRY_CLEAN" +%s 2>/dev/null || echo "0")
+            else
+                # BSD date (macOS)
+                EXPIRY_EPOCH=$(date -jf "%Y-%m-%dT%H:%M:%S" "$EXPIRY_CLEAN" +%s 2>/dev/null || echo "0")
+            fi
+
+            NOW_EPOCH=$(date +%s)
+
+            if [ "$EXPIRY_EPOCH" != "0" ] && [ "$EXPIRY_EPOCH" -gt "$NOW_EPOCH" ]; then
+                REMAINING_SECS=$((EXPIRY_EPOCH - NOW_EPOCH))
+                REMAINING_MINS=$((REMAINING_SECS / 60))
+
+                # Format time remaining nicely
+                if [ "$REMAINING_MINS" -gt 59 ]; then
+                    HOURS=$((REMAINING_MINS / 60))
+                    MINS=$((REMAINING_MINS % 60))
+                    TIME_REMAINING="$HOURS hour(s) $MINS minutes"
+                else
+                    TIME_REMAINING="$REMAINING_MINS minutes"
+                fi
+
+                echo ""
+                echo "Credentials are valid. $TIME_REMAINING before expiration."
+                echo "Profile: $ASSUMED_PROFILE_NAME"
+                echo "Expires: $EXISTING_EXPIRATION"
+                echo ""
+                echo "To force new credentials: FORCE=1 aws-assume-role $PROFILE_NAME"
+                exit 0
+            fi
+        fi
+    fi
+fi
+
+echo ""
+echo "Profile:          $PROFILE_NAME"
+echo "Source Profile:   $SOURCE_PROFILE"
+echo "Role ARN:         $ROLE_ARN"
+echo "Session Name:     $ROLE_SESSION_NAME"
+echo "Region:           ${REGION:-default}"
+echo "Duration:         $DURATION_HOURS hour(s)"
+echo ""
+echo "Assuming role..."
+
+# Assume the role using the source profile
+# Disable set -e temporarily to capture error properly
+set +e
+ASSUME_ROLE_JSON=$(aws --profile "$SOURCE_PROFILE" $REGION_ARG sts assume-role \
+    --role-arn "$ROLE_ARN" \
+    --role-session-name "$ROLE_SESSION_NAME" \
+    --duration-seconds "$DURATION_SECS" \
+    --output json 2>&1)
+AWS_EXIT_CODE=$?
+set -e
+
+if [ $AWS_EXIT_CODE -ne 0 ]; then
+    echo "ERROR: Failed to assume role"
+    echo "$ASSUME_ROLE_JSON"
+    exit 1
+fi
+
+# Parse the JSON response and extract the temporary credentials
+ACCESS_KEY=$(echo "$ASSUME_ROLE_JSON" | jq -r '.Credentials.AccessKeyId')
+SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_JSON" | jq -r '.Credentials.SecretAccessKey')
+SESSION_TOKEN=$(echo "$ASSUME_ROLE_JSON" | jq -r '.Credentials.SessionToken')
+EXPIRATION=$(echo "$ASSUME_ROLE_JSON" | jq -r '.Credentials.Expiration')
+
+if [ -z "$ACCESS_KEY" ] || [ "$ACCESS_KEY" = "null" ]; then
+    echo "ERROR: Failed to parse credentials from assume-role response"
+    exit 1
+fi
+
+# Update AWS credentials file
+cp "$HOME/.aws/credentials" "$HOME/.aws/credentials.new"
+
+# Remove any existing block for this profile
+sed "/$BEGIN_MARKER/,/$END_MARKER/d" "$HOME/.aws/credentials.new" > "$HOME/.aws/credentials.temp"
+mv "$HOME/.aws/credentials.temp" "$HOME/.aws/credentials.new"
+
+# Append new credentials block
+cat >> "$HOME/.aws/credentials.new" <<EOF
+
+$BEGIN_MARKER
+[$ASSUMED_PROFILE_NAME]
+aws_access_key_id=$ACCESS_KEY
+aws_secret_access_key=$SECRET_ACCESS_KEY
+aws_session_token=$SESSION_TOKEN
+# Expires: $EXPIRATION
+$END_MARKER
+EOF
+
+# Backup and replace credentials file
+cp -p "$HOME/.aws/credentials" "$HOME/.aws/credentials.old"
+mv "$HOME/.aws/credentials.new" "$HOME/.aws/credentials"
+
+# Also set region in config file for the assumed profile if region was specified
+if [ -n "$REGION" ]; then
+    # Check if the assumed profile already exists in config
+    if ! grep -q "^\[profile $ASSUMED_PROFILE_NAME\]" "$CONFIG_FILE" 2>/dev/null; then
+        # Add the profile to config with region
+        echo "" >> "$CONFIG_FILE"
+        echo "[profile $ASSUMED_PROFILE_NAME]" >> "$CONFIG_FILE"
+        echo "region=$REGION" >> "$CONFIG_FILE"
+    fi
+fi
+
+echo ""
+echo "SUCCESS! Created profile: $ASSUMED_PROFILE_NAME"
+echo "Credentials expire: $EXPIRATION"
+echo ""
+echo "You can now use this profile in IntelliJ or other tools:"
+echo "  - Set AWS_PROFILE=$ASSUMED_PROFILE_NAME"
+echo "  - Or use --profile $ASSUMED_PROFILE_NAME with AWS CLI"
+echo ""
+echo "To test: aws --profile $ASSUMED_PROFILE_NAME sts get-caller-identity"
